@@ -255,10 +255,30 @@ func (api *linodeProvider) getRecordsForDomain(domainID int, dc *models.DomainCo
 		}
 	}
 
-	// Linode always has read-only NS servers, but these are not mentioned in the API response
-	// https://github.com/linode/manager/blob/edd99dc4e1be5ab8190f243c3dbf8b830716255e/src/constants.js#L184
+	return appendDefaultNS(dc, existingRecords)
+}
+
+// appendDefaultNS appends Linode's read-only apex NS records to existing.
+//
+// Linode always has read-only NS servers, but these are not mentioned in the
+// API response:
+// https://github.com/linode/manager/blob/edd99dc4e1be5ab8190f243c3dbf8b830716255e/src/constants.js#L184
+//
+// We inject them into "existing" so DNSControl doesn't try to create or delete
+// them. Give them the same (TTL-rounded) TTL that the desired apex NS records
+// will have so the diff engine sees no spurious change. Without this, the
+// placeholders would differ from the desired records by TTL, producing bogus
+// corrections. In particular, IGNORE("@") copies the existing apex records into
+// "desired", and a TTL mismatch there turns the (otherwise no-op) NS records
+// into spurious CREATEs.
+func appendDefaultNS(dc *models.DomainConfig, existingRecords models.Records) (models.Records, error) {
+	nsTTL := fixTTL(apexNSDesiredTTL(dc))
 	for _, name := range defaultNameServerNames {
-		rc, err := dc.NewRecordConfig("@", 0, "NS", name)
+		// The trailing dot makes the target an absolute FQDN. Without it,
+		// NewRecordConfig treats defaultNameServerNames (which lack the dot)
+		// as relative and appends the origin, so the placeholder would never
+		// match the desired apex NS records.
+		rc, err := dc.NewRecordConfig("@", nsTTL, "NS", name+".")
 		if err != nil {
 			return nil, err
 		}
@@ -268,6 +288,17 @@ func (api *linodeProvider) getRecordsForDomain(domainID int, dc *models.DomainCo
 	}
 
 	return existingRecords, nil
+}
+
+// apexNSDesiredTTL returns the TTL of the apex NS records in the desired
+// config (they all share the same TTL), or 0 if there are none.
+func apexNSDesiredTTL(dc *models.DomainConfig) uint32 {
+	for _, rec := range dc.Records {
+		if rec.Type == "NS" && rec.GetLabel() == "@" {
+			return rec.TTL
+		}
+	}
+	return 0
 }
 
 func toRc(dc *models.DomainConfig, r *domainRecord) (*models.RecordConfig, error) {
